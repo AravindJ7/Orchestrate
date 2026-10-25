@@ -1,0 +1,67 @@
+Approach
+1) Build data index
+- Load all CSVs into memory (pandas or csv module)
+- Index users by email (current), also build reverse maps from historical identifiers found in audit log / other evidence
+- Build user identity graph: for each user_id collect all known emails/phones/name/email_hash values across time (current from user_identities + all audit log entries for that user_id) - needed because request email might be historical
+- Load deletion_rules into a lookup structure
+- Load system_activity (index by resource_id, by time ranges)
+- Load evidence_files manifest with full paths (resolve relative to dataset root)
+2) Ingest and parse all evidence
+We need to scan every evidence file under dataset/evidence/ (respecting captured_at vs audit_at - must not use evidence captured after case's audit_at). Parse by type:
+- SQL files (.sql): SQLite-compatible snapshots with customer_data_primary and possibly replicas; contains JSON in record_json with resource_id, user_id, email, phone, email_hash etc. Need to query all relevant tables, track snapshot time.
+- JSON files (.json): bundles/snapshots with records
+- TXT files (.txt) like handover docs
+- LOG files (.log): structured logs with timestamps, trace_ids, resource_ids, events, match_key containing emails/ids
+- PDF files (.pdf): business artifacts (invoices, support, handover) - need text extraction (e.g. PyPDF2/pdfplumber/pymupdf). Images may be referenced; also PNGs exist - may contain screenshots of consoles (names/ids/emails visible). Need OCR if text not extractable? Or maybe look up if any libs available; better to write a robust parser that tries text extraction first.
+- PNG/JPG images: may need OCR (pytesseract) if text present as pixels, but environment might not have tesseract installed. Need to be defensive - try to extract any embedded text or metadata; also filenames/origins give hints.
+Build a unified evidence index: for each extracted fact record associations like (email, user_id, resource_id, system_id, data_category/type hints, timestamps, file_id, raw_snippet). This is the core of connecting evidence to cases.
+3) For each case, determine if deletion authorized (NOT_APPLICABLE)
+Analyze request_text (multilingual - EN/ES/FR/JA etc as seen in samples). Look for deletion intent: "delete", "erase", "close account", "remove profile", "suppression", "eliminar", "supprimer", "削除" etc. Requests for access/correction/export/marketing opt-out are NOT_APPLICABLE. Also "download your data" alone isn't deletion request. Need to classify intent. Can do keyword/regex based classification - should be straightforward and deterministic.
+If not authorized -> status NOT_APPLICABLE, steps_json []
+4) Resolve identities (current + historical)
+For authorized cases:
+- Get request email from case
+- Find matching user in user_identities by current email (case-insensitive)
+- If not found directly, look up in audit log: find any audit entries where old_value/new_value matches the request email (or phone) and get associated user_id; also build full identity timeline for candidate users
+- Collect all known identifiers for the subject user_id(s): all emails (current + historical from audit + from evidence), phones, name variants, email_hash, user_id itself
+- Also need to consider the case says "I used this Yahoo address before changing the email on my account" etc - so must be thorough
+5) Reconstruct state at audit_at and find relevant records/risks
+For the subject identities, search across:
+- Evidence index (all parsed evidence) for mentions of any identifier/resource tied to subject
+- system_activity.csv for events involving subject identifiers/resources (filter by event_time <= audit_at)
+- Look up by user_id, emails, phones, email_hash, resource_ids that appear linked
+Identify all resources that could be relevant per deletion_rules categories (USER_PROFILE, SECONDARY_IDENTIFIER, SEARCH_INDEX_ENTRY, CACHE_ENTRY, SUPPORT_MESSAGE, SUPPORT_ATTACHMENT, ANALYTICS_PROFILE, PRODUCT_TELEMETRY, USER_EXPORT, MARKETING_PROFILE, EMAIL_DELIVERY_LOG, SECURITY_AUDIT_LOG, LEGAL_HOLD_RECORD, BACKUP_ARCHIVE, ACCOUNT_TOMBSTONE). Also look for active data flows/integrations and restore risks (backups).
+For each relevant resource found, determine its current state at audit_at from evidence (treat activity/workflow statuses as claims). Apply deletion_rules:
+- Determine required action based on data_category and conditions (e.g. SUPPORT_MESSAGE with shared context must be retained but REDACTED; SECURITY_AUDIT_LOG within retention period -> RETAIN; ACCOUNT_TOMBSTONE with only stable user_id needed -> REDACT per rule_15)
+- Check if properly treated: deleted/absent, redacted (no prohibited identifiers), anonymized, or retained as required
+Also need to find recreation risks: active sync/import/data flows (integration_service data_flow_*) that can copy/recreate data; backups that can restore (backup_service). These are findings as REPORT_ACTIVE_DATA_FLOW / REPORT_RESTORE_RISK.
+6) Decide COMPLETE vs INCOMPLETE
+Deletion is COMPLETE only if:
+- every relevant copy has received treatment required by deletion_rules.csv
+- no active sync/import/restore path can recreate the data  
+- retained records contain only identifiers permitted by rules
+- records that must be retained remain available
+Also tombstones: preserve stable internal user_id, remove name/email/phone/email_hash and other direct identifiers as required.
+If ANY relevant record not properly treated OR active recreation path exists that isn't mitigated OR retained record has prohibited identifiers exposed -> INCOMPLETE. Otherwise COMPLETE (if authorized).
+7) Generate steps_json with correct ordering
+Phase order: FINDING, then REMEDIATION, then VERIFICATION (globally). Within each phase, follow operation order as given in tables, followed by system_id ascending, then resource_id ascending.
+For INCOMPLETE:
+- FINDING phase: cite evidence (use actual file_id/activity_id/audit_id that proves). Operations: REPORT_REMAINING_RECORD (PRESENT), REPORT_EXPOSED_PII (PRESENT), REPORT_ACTIVE_DATA_FLOW (ACTIVE), REPORT_RESTORE_RISK (ACTIVE)
+- REMEDIATION phase: proposed actions with evidence_id="" (empty string). Order: within remediation, disable data flows and block unsafe restores BEFORE changing dependent records. Process downstream copies before their source records when dependency requires. Operations: DISABLE_DATA_FLOW (DISABLED), BLOCK_RESTORE (BLOCKED), DELETE_RECORD (ABSENT), REDACT_RECORD (REDACTED), ANONYMIZE_RECORD (ANONYMIZED)
+- VERIFICATION phase: evidence_id=""
+For COMPLETE: only VERIFICATION steps proving current compliant state. Must cite evidence (file_id/activity_id/audit_id). Operations as per verification table.
+For NOT_APPLICABLE: []
+Need to map found resources to (system_id, resource_id, data category) correctly. The samples show patterns like account_service/account_XXX, search_service/search_XXX, support_platform/support_XXX, analytics_platform/analytics_XXX, backup_service/backup_XXX, integration_service/data_flow_XXX, export_service/export_XXX, security_service/audit_record_XXX, identity_service/tombstone_XXX etc.
+Also "within remediation, disable data flows and block unsafe restores before changing dependent records" - so DISABLE_DATA_FLOW/BLOCK_RESTORE come before DELETE/REDACT/ANONYMIZE of dependent records.
+Implementation details
+- Write as Python script(s). Put in code/main.py as entry point (as suggested). Also need to produce output.csv at repo root.
+- Deterministic output (sorting by case_id is required; step ordering must follow rules).
+- Read from dataset/ relative to repo root. Repo root is hackerrank-orchestrate-october26/ or could be run from different locations - need to resolve paths correctly relative to script location or cwd.
+- No hardcoded golden labels. Must derive everything from data.
+- Handle encoding (utf-8-sig for CSVs as we saw).
+- For PDFs/images - try to extract text; if libraries missing, may need to install or find alternative. But in environment we need to be self-contained? The code.zip must be runnable - dependencies need to be specified. Maybe use basic libraries available or install minimal deps. Let us look up what's installed? Also maybe the evidence can be parsed without heavy OCR for most cases.
+- For SQL, can use sqlite3 to load and query.
+- JSON logs etc are straightforward.
+- Need to be careful about "use only info at or before audit_at" - filter evidence by captured_at <= audit_at? The rule says "Evidence created later must not change the answer for that case" and "Never cite organizer-only truth or an evidence item captured after the case's audit_at". So when building evidence index for a specific case, only consider evidence with captured_at <= case.audit_at.
+- Also system_activity filtered by event_time <= audit_at.
+This is a complex challenge - need a systematic approach. Let us start building the solution structure. First, create the directories if needed and start writing the main script.

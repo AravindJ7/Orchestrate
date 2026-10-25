@@ -129,7 +129,7 @@ You may use any programming language, model, framework, or retrieval approach. I
 To package `code.zip` from the repository root without bundling the dataset:
 
 **macOS / Linux:**
-
+`
 ```bash
 zip -r code.zip README.md code -x "*/__pycache__/*" "*/.venv/*" "*/venv/*" "*/node_modules/*" "*/.git/*" "*/.DS_Store"
 ```
