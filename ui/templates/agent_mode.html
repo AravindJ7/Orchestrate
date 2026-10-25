@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block title %}Agent Mode - NVIDIA NIM{% endblock %}
+{% block content %}
+<div class="row">
+  <div class="col-lg-12">
+    <h2><i class="bi bi-robot"></i> AI Agent Mode (NVIDIA NIM)</h2>
+    <p class="text-muted mb-1">
+      The LLM acts as a task manager and calls the existing deterministic engine through tools:
+      <code>resolve_identity</code>, <code>search_evidence</code>, <code>get_deletion_rules</code>, <code>analyze_case</code>.
+    </p>
+    <p class="text-muted small">
+      The audit findings still come from the rule engine — the model only plans and reports. The authoritative
+      result is always shown next to the agent's answer.
+    </p>
+  </div>
+</div>
+
+<div class="row mt-3">
+  <div class="col-lg-10">
+    <div class="card">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="mb-0">Run Agent on a Case</h5>
+        {% if sample_cases %}
+        <div class="d-flex align-items-center gap-2">
+          <label class="text-muted small mb-0">Load sample:</label>
+          <select id="samplePicker" class="form-select form-select-sm" style="width: 220px;">
+            <option value="">— select —</option>
+            {% for c in sample_cases %}
+              <option value="{{ loop.index0 }}">{{ c.case_id }} ({{ c.email }})</option>
+            {% endfor %}
+          </select>
+        </div>
+        {% endif %}
+      </div>
+      <div class="card-body">
+        {% if not agent_available %}
+        <div class="alert alert-warning">Agent not available. Check dependencies and <code>.env</code> configuration.</div>
+        {% endif %}
+        <form action="{{ url_for('agent_analyze') }}" method="POST" id="agentForm">
+          <div class="row mb-3">
+            <div class="col-md-6"><label class="form-label">Case ID</label><input name="case_id" id="f_case_id" class="form-control" required></div>
+            <div class="col-md-6"><label class="form-label">Email</label><input name="email" id="f_email" class="form-control" required></div>
+          </div>
+          <div class="row mb-3">
+            <div class="col-md-4"><label class="form-label">Audit At</label><input name="audit_at" id="f_audit_at" class="form-control" placeholder="2026-07-19T13:00:00Z" required></div>
+            <div class="col-md-4"><label class="form-label">Requested At</label><input name="requested_at" id="f_requested_at" class="form-control" placeholder="2026-07-19T13:00:00Z"></div>
+            <div class="col-md-4"><label class="form-label">Reported Status</label>
+              <select name="reported_status" id="f_reported_status" class="form-select">
+                <option>NOT_STARTED</option><option>PARTIALLY_COMPLETE</option><option>COMPLETE</option><option>UNKNOWN</option>
+              </select>
+            </div>
+          </div>
+          <div class="mb-3"><label class="form-label">Reported At</label><input name="reported_at" id="f_reported_at" class="form-control" placeholder="optional"></div>
+          <div class="mb-3"><label class="form-label">Request Text</label><textarea name="request_text" id="f_request_text" class="form-control" rows="4" required></textarea></div>
+          <button class="btn btn-primary" id="runBtn" {% if not agent_available %}disabled{% endif %}>
+            <i class="bi bi-cpu"></i> Run Agent
+          </button>
+          <span class="text-muted small ms-2" id="runHint"></span>
+        </form>
+      </div>
+    </div>
+
+    {% if models %}
+    <div class="card mt-3">
+      <div class="card-header"><h6 class="mb-0">Models available to this API key ({{ models|length }})</h6></div>
+      <div class="card-body">
+        <p class="small text-muted mb-2">Configure the primary model in <code>.env</code> as <code>NVIDIA_MODEL=...</code></p>
+        <div style="max-height: 220px; overflow-y: auto;">
+          <ul class="mb-0 small">
+          {% for m in models %}
+            <li><code>{{ m.id }}</code>{% if m.owned_by %} <span class="text-muted">({{ m.owned_by }})</span>{% endif %}</li>
+          {% endfor %}
+          </ul>
+        </div>
+      </div>
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+{% if sample_cases %}
+<script>
+const SAMPLES = {{ sample_cases | tojson }};
+const picker = document.getElementById('samplePicker');
+if (picker) {
+  picker.addEventListener('change', () => {
+    if (picker.value === '') return;
+    const c = SAMPLES[parseInt(picker.value, 10)];
+    document.getElementById('f_case_id').value = c.case_id || '';
+    document.getElementById('f_email').value = c.email || '';
+    document.getElementById('f_audit_at').value = c.audit_at || '';
+    document.getElementById('f_requested_at').value = c.requested_at || '';
+    document.getElementById('f_reported_at').value = c.reported_at || '';
+    document.getElementById('f_request_text').value = c.request_text || '';
+    const sel = document.getElementById('f_reported_status');
+    if (c.reported_status) sel.value = c.reported_status;
+  });
+}
+const form = document.getElementById('agentForm');
+form.addEventListener('submit', () => {
+  document.getElementById('runBtn').disabled = true;
+  document.getElementById('runHint').textContent = 'Running agent… this can take 20–60 seconds.';
+});
+</script>
+{% endif %}
+{% endblock %}

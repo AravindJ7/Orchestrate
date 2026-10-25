@@ -21,6 +21,14 @@ from data_index import DataIndex
 from evidence_parser import EvidenceParser
 from audit_engine import AuditEngine, DeletionAuditAgent, is_deletion_authorized
 
+try:
+    from agent.orchestrator import AgentOrchestrator
+    AGENT_AVAILABLE = True
+except Exception as e:
+    print(f"Agent mode not available: {e}")
+    AgentOrchestrator = None
+    AGENT_AVAILABLE = False
+
 app = Flask(__name__)
 app.secret_key = 'ghost-data-still-exists-ui'
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max
@@ -187,6 +195,57 @@ def api_analyze():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/agent_mode')
+def agent_mode():
+    try:
+        init_agent()
+        models = []
+        try:
+            from agent.model_discovery import list_nvidia_models
+            models = list_nvidia_models()
+        except Exception:
+            pass
+        sample_cases = []
+        try:
+            sample_path = DATASET_DIR / 'sample_deletion_requests.csv'
+            if sample_path.exists():
+                with open(sample_path, encoding='utf-8-sig', newline='') as f:
+                    sample_cases = list(csv.DictReader(f))
+        except Exception:
+            pass
+        return render_template('agent_mode.html', models=models,
+                               agent_available=AGENT_AVAILABLE,
+                               sample_cases=sample_cases)
+    except Exception as e:
+        flash(f'Agent init error: {e}', 'error')
+        return redirect(url_for('index'))
+
+
+@app.route('/agent_analyze', methods=['POST'])
+def agent_analyze():
+    try:
+        if not AGENT_AVAILABLE or AgentOrchestrator is None:
+            flash('Agent mode not available. Check agent setup and .env.', 'error')
+            return redirect(url_for('agent_mode'))
+        init_agent()
+        case = {
+            'case_id': request.form.get('case_id') or 'agent_case',
+            'email': request.form.get('email', ''),
+            'request_text': request.form.get('request_text', ''),
+            'audit_at': request.form.get('audit_at', ''),
+            'requested_at': request.form.get('requested_at', ''),
+            'reported_status': request.form.get('reported_status', 'UNKNOWN'),
+            'reported_at': request.form.get('reported_at', ''),
+        }
+        orch = AgentOrchestrator()
+        result = orch.analyze(case)
+        return render_template('agent_result.html', result=result, case=case)
+    except Exception as e:
+        flash(f'Agent error: {e}', 'error')
+        return redirect(url_for('agent_mode'))
+
 
 if __name__ == '__main__':
     init_agent()

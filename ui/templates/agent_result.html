@@ -1,0 +1,164 @@
+{% extends "base.html" %}
+{% block title %}Agent Result{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center">
+  <div>
+    <h2><i class="bi bi-robot"></i> Agent Analysis Result</h2>
+    <p class="text-muted mb-0">
+      Case: <strong>{{ case.case_id }}</strong> |
+      Email: <strong>{{ case.email }}</strong> |
+      Audit At: <strong>{{ case.audit_at }}</strong>
+    </p>
+  </div>
+  <a href="{{ url_for('agent_mode') }}" class="btn btn-outline-secondary"><i class="bi bi-arrow-left"></i> Back</a>
+</div>
+
+{% if result.error %}
+<div class="alert alert-danger mt-3">
+  <strong>Agent error:</strong> {{ result.error }}
+</div>
+{% endif %}
+
+{% set det = result.deterministic if result.deterministic else result.deterministic_fallback %}
+{% set parsed = result.parsed %}
+
+{% if det and not det.error %}
+<div class="card mt-3 border-success">
+  <div class="card-header bg-success text-white">
+    <h5 class="mb-0"><i class="bi bi-shield-check"></i> Authoritative Result (deterministic engine)</h5>
+  </div>
+  <div class="card-body">
+    <p class="mb-2">
+      <span class="badge fs-6
+        {% if det.deletion_status == 'COMPLETE' %}bg-success
+        {% elif det.deletion_status == 'INCOMPLETE' %}bg-danger
+        {% else %}bg-secondary{% endif %}">
+        {{ det.deletion_status }}
+      </span>
+      <span class="text-muted ms-2">{{ det.steps|length }} step(s)</span>
+    </p>
+    <div class="table-responsive">
+      <table class="table table-sm table-bordered align-middle">
+        <thead class="table-light">
+          <tr>
+            <th>#</th><th>Phase</th><th>System</th><th>Resource</th>
+            <th>Operation</th><th>State</th><th>Evidence</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for s in det.steps %}
+          <tr>
+            <td>{{ s.step_no }}</td>
+            <td>
+              <span class="badge
+                {% if s.phase == 'FINDING' %}bg-danger
+                {% elif s.phase == 'REMEDIATION' %}bg-warning text-dark
+                {% else %}bg-info text-dark{% endif %}">{{ s.phase }}</span>
+            </td>
+            <td><code>{{ s.system_id }}</code></td>
+            <td><code>{{ s.resource_id }}</code></td>
+            <td>{{ s.operation }}</td>
+            <td>{{ s.state }}</td>
+            <td>{% if s.evidence_id %}<code>{{ s.evidence_id }}</code>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <label class="form-label mt-2"><strong>output.csv row (steps_json)</strong></label>
+    <textarea class="form-control font-monospace" rows="3" readonly>{{ det.steps_json }}</textarea>
+    <button class="btn btn-sm btn-outline-primary mt-2" onclick="copyText(this.previousElementSibling)"><i class="bi bi-clipboard"></i> Copy steps_json</button>
+  </div>
+</div>
+{% endif %}
+
+{% if parsed %}
+<div class="card mt-3 {% if parsed.schema_valid %}border-primary{% else %}border-warning{% endif %}">
+  <div class="card-header {% if parsed.schema_valid %}bg-primary text-white{% else %}bg-warning{% endif %}">
+    <h5 class="mb-0"><i class="bi bi-cpu"></i> Agent Output ({{ result.model }})</h5>
+  </div>
+  <div class="card-body">
+    <p class="mb-2">
+      <span class="badge fs-6
+        {% if parsed.deletion_status == 'COMPLETE' %}bg-success
+        {% elif parsed.deletion_status == 'INCOMPLETE' %}bg-danger
+        {% else %}bg-secondary{% endif %}">{{ parsed.deletion_status }}</span>
+      <span class="text-muted ms-2">{{ parsed.steps|length }} step(s)</span>
+      {% if parsed.recovered_from_tool %}
+        <span class="badge bg-warning text-dark ms-2" title="{{ parsed.problems | join('; ') }}">recovered from analyze_case tool output</span>
+      {% endif %}
+      {% if result.comparison %}
+        {% if result.comparison.status_match %}
+          <span class="badge bg-success ms-2">status matches engine</span>
+        {% elif result.comparison.status_match is sameas false %}
+          <span class="badge bg-danger ms-2">status differs from engine (engine wins)</span>
+        {% endif %}
+        {% if result.comparison.steps_match %}
+          <span class="badge bg-success ms-2">steps match engine</span>
+        {% endif %}
+      {% endif %}
+    </p>
+
+    {% if parsed.problems %}
+      <div class="alert alert-warning py-2 mb-2">
+        <strong>Schema issues:</strong>
+        <ul class="mb-0">{% for p in parsed.problems %}<li>{{ p }}</li>{% endfor %}</ul>
+      </div>
+    {% else %}
+      <p class="text-success small mb-2"><i class="bi bi-check-circle"></i> Output validates against the required step schema.</p>
+    {% endif %}
+
+    <textarea class="form-control font-monospace" rows="4" readonly>{{ parsed.steps_json }}</textarea>
+  </div>
+</div>
+{% elif result.answer %}
+<div class="card mt-3 border-warning">
+  <div class="card-header bg-warning"><h5 class="mb-0">Agent Final Message (unparsed)</h5></div>
+  <div class="card-body"><pre class="mb-0">{{ result.answer }}</pre></div>
+</div>
+{% endif %}
+
+<div class="card mt-3">
+  <div class="card-header">
+    <h5 class="mb-0"><i class="bi bi-list-check"></i> Agent Trace</h5>
+  </div>
+  <div class="card-body" style="max-height: 520px; overflow-y: auto;">
+    {% if result.trace %}
+      {% for t in result.trace %}
+        {% if t.type == 'thought' and t.content %}
+          <div class="mb-3">
+            <span class="badge bg-secondary">Thought</span>
+            <div class="mt-1 small" style="white-space: pre-wrap;">{{ t.content }}</div>
+          </div>
+        {% elif t.type == 'tool_call' %}
+          <div class="mb-3">
+            <span class="badge bg-info text-dark">Tool call</span> <strong>{{ t.tool }}</strong>
+            <pre class="mt-1 mb-0 small bg-light p-2 rounded">{{ t.args | tojson(indent=2) }}</pre>
+          </div>
+        {% elif t.type == 'tool_result' %}
+          <div class="mb-3">
+            <span class="badge bg-success">Tool result</span> <strong>{{ t.tool }}</strong>
+            <pre class="mt-1 mb-0 small bg-light p-2 rounded" style="max-height: 220px; overflow-y: auto;">{{ t.result | tojson(indent=2) }}</pre>
+          </div>
+        {% elif t.type == 'final' %}
+          <div class="mb-3">
+            <span class="badge bg-primary">Final answer</span>
+            <pre class="mt-1 mb-0 small bg-light p-2 rounded">{{ t.content }}</pre>
+          </div>
+        {% endif %}
+      {% endfor %}
+    {% else %}
+      <p class="text-muted mb-0">No trace recorded.</p>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function copyText(el) {
+  el.select();
+  navigator.clipboard.writeText(el.value);
+}
+</script>
+{% endblock %}

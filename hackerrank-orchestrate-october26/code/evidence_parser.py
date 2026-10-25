@@ -131,25 +131,70 @@ SYSTEM_ID_MAP = {
     "email_delivery_service": "notification_service",
     "object_store": "object_store",
     "cache_service": "cache_service",
-    # SQL table names -> canonical system_id
+    # SQL table / collection names -> canonical system_id
     "customer_profiles": "account_service",
     "customer_search_documents": "search_service",
+    "search_documents": "search_service",
     "customer_analytics_profiles": "analytics_platform",
     "customer_analytics_reports": "analytics_platform",
     "support_records": "support_platform",
     "customer_exports": "export_service",
+    "customer_export_jobs": "export_service",
+    "user_export_store": "export_service",
+    "customer_export_store": "export_service",
     "connector_subscriptions": "integration_service",
+    # Replica / read-only service instances map to their canonical service.
+    "support_replica": "support_platform",
+    "backup_replica": "backup_service",
+    "search_replica": "search_service",
+    "analytics_replica": "analytics_platform",
     "backup_restore_entries": "backup_service",
     "security_audit_records": "security_service",
 }
 
+# Suffixes stripped from SQL table names before the system-id lookup.
+_TABLE_SUFFIXES = (
+    "_failover_replica",
+    "_primary",
+    "_read_replica",
+    "_regional_replicas",
+    "_reporting_replica",
+    "_store",
+    "_inventory",
+    "_replica",
+)
+
+# Service name -> deletion-rule data_category for service_exports JSON blocks.
+SERVICE_TO_CATEGORY = {
+    "account_service": "USER_PROFILE",
+    "search_service": "SEARCH_INDEX_ENTRY",
+    "analytics_platform": "ANALYTICS_PROFILE",
+    "support_platform": "SUPPORT_MESSAGE",
+    "export_service": "USER_EXPORT",
+    "integration_service": "MARKETING_PROFILE",
+    "backup_service": "BACKUP_ARCHIVE",
+    "security_service": "SECURITY_AUDIT_LOG",
+    "identity_service": "ACCOUNT_TOMBSTONE",
+}
+
 
 def infer_system_id(data_store_or_system):
-    """Map a raw data_store / system name to a canonical system_id."""
+    """Map a raw data_store / system / table name to a canonical system_id.
+
+    SQL snapshot tables carry suffixes like ``_failover_replica`` /
+    ``_primary`` that must be stripped before the canonical lookup.
+    """
     if not data_store_or_system:
         return "unknown"
     key = str(data_store_or_system).strip()
-    return SYSTEM_ID_MAP.get(key, key)
+    if key in SYSTEM_ID_MAP:
+        return SYSTEM_ID_MAP[key]
+    for suf in _TABLE_SUFFIXES:
+        if key.endswith(suf):
+            base = key[: -len(suf)]
+            if base in SYSTEM_ID_MAP:
+                return SYSTEM_ID_MAP[base]
+    return key
 
 
 def infer_category(collection_or_table_or_record_type, record_type_hint=None):
@@ -222,6 +267,10 @@ PHONE_RE = re.compile(r"(?<!\d)(?<!\dT)(?<!\d-)\+?\d[\d\s()\-]{6,}\d(?!\d)")
 USER_ID_RE = re.compile(r"\buser_\d+\b")
 RESOURCE_ID_RE = re.compile(r"\b(?:account|search|analytics|support|export|backup|audit_record|data_flow|tombstone)_\d+\b")
 DATE_ONLY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+# Correlate related log lines (e.g. lookup_started / lookup_completed) that share
+# a trace_id so a resource record inherits the user identifiers from its lookup.
+TRACE_ID_RE = re.compile(r"\btrace_id[=:\s]+([A-Za-z0-9_-]+)\b")
+CORRELATION_KEY_RE = re.compile(r"\bcorrelation_key[=:\s]+([A-Za-z0-9_-]+)\b")
 
 
 def extract_identifiers_from_text(text):
@@ -321,6 +370,8 @@ class EvidenceParser:
         # Indexes
         self.identifier_index = {}   # normalized identifier -> [(file_id, record_idx), ...]
         self.resource_index = {}     # resource_id -> [(file_id, record_idx), ...]
+        # Stable ordering: id(record) -> (manifest_position, in_file_position)
+        self._record_position = {}
 
     # ------------------------------------------------------------------ main
     def parse_all(self, audit_at=None):
@@ -338,10 +389,18 @@ class EvidenceParser:
         self.parse_status = {}
         self.identifier_index = {}
         self.resource_index = {}
+        self._record_position = {}
 
         for ef in self.index.evidence_files:
             fid = ef.get("file_id")
             self.parse_file(fid)
+
+        # Stable canonical position for every parsed record: evidence-manifest
+        # order first, then in-file order. Query results are sorted by this so
+        # that step ordering is identical across processes (no set/hash order).
+        for file_pos, (fid, records) in enumerate(self.evidence_records.items()):
+            for rec_pos, rec in enumerate(records):
+                self._record_position[id(rec)] = (file_pos, rec_pos)
         return self.parse_status
 
     def parse_file(self, file_id):
@@ -358,6 +417,7 @@ class EvidenceParser:
             return {"error": "file_missing"}
 
         ext = full_path.suffix.lower()
+        origin = ef.get("origin", "")
         try:
             if ext == ".sql":
                 records = self._parse_sql(file_id, full_path)
@@ -366,10 +426,10 @@ class EvidenceParser:
             elif ext in (".txt", ".log"):
                 records = self._parse_text(file_id, full_path)
             elif ext == ".pdf":
-                records = self._parse_pdf(file_id, full_path)
+                records = self._parse_pdf(file_id, full_path, origin=origin)
             elif ext in (".png", ".jpg", ".jpeg"):
                 # Image evidence: extract metadata only (OCR needs tesseract binary)
-                records = self._parse_image(file_id, full_path)
+                records = self._parse_image(file_id, full_path, origin=origin)
             else:
                 records = []
                 self.unparsed_files[file_id] = ef
@@ -402,6 +462,16 @@ class EvidenceParser:
             tables = [r[0] for r in cur.fetchall()]
 
             captured_at = self._captured_at_from_sql(script)
+            # Some snapshot exports record the capture time in a snapshot_scope
+            # table instead of a SQL comment. Prefer it when present.
+            try:
+                scope = con.execute(
+                    "SELECT captured_at FROM snapshot_scope LIMIT 1"
+                ).fetchall()
+                if scope and scope[0][0]:
+                    captured_at = scope[0][0]
+            except sqlite3.Error:
+                pass
 
             for table in tables:
                 data_category = infer_category(table)
@@ -437,6 +507,9 @@ class EvidenceParser:
         m = re.search(r"--\s*snapshot_completed_at\s*=\s*([^\n]+)", script)
         if m:
             return m.group(1).strip()
+        m = re.search(r"--\s*captured at:\s*([^\n]+)", script, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
         m = re.search(r"captured_at\s*=\s*'([^']+)'", script)
         if m:
             return m.group(1).strip()
@@ -453,11 +526,16 @@ class EvidenceParser:
             return None
 
         system_id = infer_system_id(table)
-        # If the row has an explicit system column, prefer it over the table name
-        for sys_col in ("system", "origin_system", "source_system", "data_store"):
+        # If the row has an explicit origin/data_store column, prefer it over
+        # the table name (SQL replicas often bundle many collections under one
+        # generic table name).
+        for sys_col in ("origin_system", "data_store", "source_system", "system"):
             if sys_col in row_dict and row_dict[sys_col]:
                 system_id = infer_system_id(row_dict[sys_col])
                 break
+        # Prefer the explicit collection name for the data category.
+        if row_dict.get("collection_name"):
+            data_category = infer_category(row_dict.get("collection_name"))
         state = map_result_to_state(row_dict.get("account_status") or row_dict.get("status") or row_dict.get("result"), data_category)
         # Special handling: account_status DELETION_PENDING / ACTIVE means PRESENT
         acct_status = (row_dict.get("account_status") or "").strip().lower()
@@ -505,29 +583,37 @@ class EvidenceParser:
 
         # Schema A: snapshot bundle -> snapshots[] with data_store/collection/records
         if "snapshots" in data and isinstance(data["snapshots"], list):
+            # Use the file-level capture time (when the bundle was captured) as
+            # the evidence timestamp for every record it contains. Per-snapshot
+            # times describe the data vintage, not when this evidence was
+            # captured; the audit cutoff applies to the evidence capture time.
             for snap in data["snapshots"]:
-                snap_captured = snap.get("captured_at") or captured_at
                 data_store = snap.get("data_store")
                 collection = snap.get("collection")
                 data_category = infer_category(collection)
                 system_id = infer_system_id(data_store)
                 for rec in snap.get("records", []):
                     records.append(self._json_record_to_evidence(
-                        file_id, rec, data_category, system_id, snap_captured, "snapshot_bundle"))
+                        file_id, rec, data_category, system_id, captured_at, "snapshot_bundle"))
             return records
 
-        # Schema B: service_resource_export -> service_exports[service][profile_lookups|profiles]
+        # Schema B: service_resource_export -> service_exports[service][list_key]
         if "service_exports" in data and isinstance(data["service_exports"], dict):
             for service_name, service_block in data["service_exports"].items():
+                if not isinstance(service_block, dict):
+                    continue
                 system_id = infer_system_id(service_name)
-                for list_key in ("profile_lookups", "profiles", "records"):
-                    items = service_block.get(list_key)
+                data_category = SERVICE_TO_CATEGORY.get(
+                    service_name, infer_category(service_name))
+                # Every list-valued key under the service holds records.
+                for list_key, items in service_block.items():
                     if not isinstance(items, list):
                         continue
-                    data_category = infer_category(list_key or service_name)
                     for rec in items:
                         records.append(self._json_record_to_evidence(
-                            file_id, rec, data_category, system_id, captured_at, "service_export"))
+                            file_id, rec, data_category, system_id,
+                            captured_at, "service_export",
+                            service_name=service_name, list_key=list_key))
             return records
 
         # Schema C: flat records[] (connector_configurations, security_audit_ledger,
@@ -558,7 +644,8 @@ class EvidenceParser:
             })
         return records
 
-    def _json_record_to_evidence(self, file_id, rec, data_category, system_id, captured_at, schema):
+    def _json_record_to_evidence(self, file_id, rec, data_category, system_id, captured_at, schema,
+                                 service_name=None, list_key=None):
         if not isinstance(rec, dict):
             return None
         rid = rec.get("resource_id") or rec.get("id")
@@ -573,6 +660,9 @@ class EvidenceParser:
             state = "ABSENT"
         if rec.get("status_code") == 200 and rec.get("profile") is not None:
             state = "PRESENT"
+
+        # Per-service state inference for service_resource_export records.
+        state = self._infer_json_service_state(service_name, rec, data_category, state)
 
         # Detect redaction / anonymization in any text field
         for v in rec.values():
@@ -603,6 +693,74 @@ class EvidenceParser:
             "raw": rec,
             "schema": schema,
         }
+
+    def _infer_json_service_state(self, service_name, rec, data_category, state):
+        """Refine state for service_resource_export records using service
+        semantics (enabled flags, restore flags, hit counts, PII presence)."""
+        if not service_name:
+            return state
+        # --- account_service: profile lookups ---
+        if service_name == "account_service":
+            profile = rec.get("profile")
+            status = rec.get("status_code")
+            if profile is None and status in (404, "404", None):
+                return "ABSENT"
+            if profile is not None and status in (200, "200"):
+                return "PRESENT"
+            return state
+        # --- security_service: audit records are retained (PRESENT) ---
+        if service_name == "security_service":
+            return "PRESENT"
+        # --- analytics_platform: no direct identifiers => anonymized ---
+        if service_name == "analytics_platform":
+            ids = extract_identifiers_from_obj(rec)
+            if not ids["emails"] and not ids["phones"] and not ids["email_hashes"]:
+                return "ANONYMIZED"
+            return state
+        # --- support_platform: PII present => identifiable, else redacted ---
+        if service_name == "support_platform":
+            ids = extract_identifiers_from_obj(rec)
+            if ids["emails"] or ids["phones"]:
+                return state if state in ("PRESENT", "IDENTIFIABLE") else "PRESENT"
+            return "REDACTED"
+        # --- integration_service: connector enabled flag ---
+        if service_name == "integration_service":
+            enabled = rec.get("enabled")
+            status = str(rec.get("last_delivery_status", "")).lower()
+            if enabled in (False, 0, "0", "false") or status in ("stopped", "disabled"):
+                return "DISABLED"
+            if enabled in (True, 1, "1", "true") or status in ("delivered", "active", "enabled"):
+                return "ACTIVE"
+            return state
+        # --- backup_service: restore allowed flag ---
+        if service_name == "backup_service":
+            ra = rec.get("restore_allowed")
+            if ra in (False, 0, "0", "false"):
+                return "BLOCKED"
+            if ra in (True, 1, "1", "true"):
+                return "ACTIVE"
+            return state
+        # --- search_service: index query hit count ---
+        if service_name == "search_service":
+            hits = rec.get("hits")
+            total = 0
+            if isinstance(hits, dict):
+                total = hits.get("total", 0) or 0
+            elif isinstance(hits, (int, str)):
+                try:
+                    total = int(hits)
+                except Exception:
+                    total = 0
+            docs = rec.get("documents")
+            if isinstance(docs, list):
+                total = max(total, len(docs))
+            if total > 0:
+                return "PRESENT"
+            return "ABSENT"
+        # --- export_service: export job present ---
+        if service_name == "export_service":
+            return state if state else "PRESENT"
+        return state
 
     # ----------------------------------------------------------- text/log parsing
     def _parse_text(self, file_id, path):
@@ -666,6 +824,7 @@ class EvidenceParser:
                     "captured_at": line_ts or captured_at,
                     "identifiers": identifiers,
                     "raw": {"line": line, "parsed": m.groupdict()},
+                    "_trace_id": (mtrace.group(1) if (mtrace := TRACE_ID_RE.search(line)) else None),
                 })
                 continue
 
@@ -708,6 +867,11 @@ class EvidenceParser:
                     found = extract_identifiers_from_text(matched)
                     identifiers["emails"] = sorted(set(identifiers["emails"]) | set(found["emails"]))
                     identifiers["phones"] = sorted(set(identifiers["phones"]) | set(found["phones"]))
+                # A correlation_key is typically an email hash; index it so a
+                # record can be attributed to a user via their historical hash.
+                ckey = kv.get("correlation_key", "")
+                if ckey and len(ckey) >= 32 and all(c in "0123456789abcdef" for c in ckey.lower()):
+                    identifiers["email_hashes"] = sorted(set(identifiers.get("email_hashes", [])) | {ckey.lower()})
                 records.append({
                     "file_id": file_id,
                     "resource_id": rid,
@@ -717,6 +881,7 @@ class EvidenceParser:
                     "captured_at": line_ts or captured_at,
                     "identifiers": identifiers,
                     "raw": {"line": line, "kv": kv},
+                    "_trace_id": (mtrace.group(1) if (mtrace := TRACE_ID_RE.search(line)) else None),
                 })
                 continue
 
@@ -733,17 +898,36 @@ class EvidenceParser:
                     "captured_at": line_ts or captured_at,
                     "identifiers": ids,
                     "raw": {"line": line},
+                    "_trace_id": (mtrace.group(1) if (mtrace := TRACE_ID_RE.search(line)) else None),
                 })
+
+        # --- correlate log lines sharing a trace_id -------------------------
+        # A lookup_started line carries the user's identifiers; the matching
+        # lookup_completed line carries the resource_id. Merge identifiers within
+        # each trace_id group so resource records become attributable to the user.
+        groups = {}
+        for rec in records:
+            tid = rec.pop("_trace_id", None)
+            if tid:
+                groups.setdefault(tid, []).append(rec)
+        for tid, group in groups.items():
+            merged = {"emails": set(), "phones": set(), "names": set(),
+                      "email_hashes": set(), "user_ids": set()}
+            for rec in group:
+                for k, v in rec.get("identifiers", {}).items():
+                    merged[k].update(v)
+            merged = {k: sorted(v) for k, v in merged.items()}
+            for rec in group:
+                if rec.get("resource_id"):
+                    rec["identifiers"] = merged
 
         return records
 
     # ----------------------------------------------------------- PDF parsing
-    def _parse_pdf(self, file_id, path):
+    def _parse_pdf(self, file_id, path, origin=""):
         """Extract text from a PDF and turn it into evidence records."""
         records = []
         captured_at = None
-        # Try to get captured_at from manifest is handled by caller; here we
-        # just extract text. The manifest captured_at is used at query time.
         full_text = ""
         try:
             if _HAS_PDFPLUMBER:
@@ -760,19 +944,18 @@ class EvidenceParser:
 
         if full_text.strip():
             identifiers = extract_identifiers_from_text(full_text)
-            # Try to find a resource_id in the text
             rid_match = RESOURCE_ID_RE.search(full_text)
             rid = rid_match.group(0) if rid_match else None
             if not rid:
-                # No real resource found in a PDF - skip it. PDF documents like
-                # retention registers don't contain per-resource evidence.
                 return records
-            # Try to find a system hint
             system = "unknown"
             for sys_name in SYSTEM_ID_MAP:
                 if sys_name in full_text.lower():
                     system = SYSTEM_ID_MAP[sys_name]
                     break
+            # Fall back to the manifest origin (e.g. "support_platform").
+            if system == "unknown" and origin:
+                system = infer_system_id(origin)
             records.append({
                 "file_id": file_id,
                 "resource_id": rid,
@@ -786,22 +969,22 @@ class EvidenceParser:
         return records
 
     # ----------------------------------------------------------- Image parsing
-    def _parse_image(self, file_id, path):
+    def _parse_image(self, file_id, path, origin=""):
         """Extract basic metadata from an image (no OCR without tesseract)."""
         records = []
         try:
             if _HAS_PIL:
                 with Image.open(path) as img:
-                    # Record image dimensions and format as metadata
                     _ = img.size, img.format
         except Exception:
             pass
         # Opaque image - record as an evidence mention with no content
         identifiers = extract_identifiers_from_text(file_id)
+        system = infer_system_id(origin) if origin else "unknown"
         records.append({
             "file_id": file_id,
             "resource_id": f"unknown_{file_id}",
-            "system_id": "unknown",
+            "system_id": system,
             "data_category": "USER_PROFILE",
             "state": "PRESENT",
             "captured_at": None,
@@ -858,8 +1041,9 @@ class EvidenceParser:
 
         seen = set()
         results = []
-        # First pass: match by identifier
-        for ident in all_identifiers:
+        # First pass: match by identifier. Iterate in sorted order so that
+        # deduplication and the resulting order never depend on set/hash order.
+        for ident in sorted(all_identifiers, key=lambda v: str(v)):
             n = normalize_email(ident) if "@" in str(ident) else normalize_value(ident)
             if not n:
                 continue
@@ -876,13 +1060,16 @@ class EvidenceParser:
 
         # Second pass: add sibling records for the same resource_id
         sibling_keys = {(r["file_id"], r["resource_id"]) for r in results}
-        for fid, rid in sibling_keys:
+        for fid, rid in sorted(sibling_keys):
             for rec in self.records_for_resource(rid, audit_at=audit_at):
                 key = (rec["file_id"], rec["resource_id"], rec["state"])
                 if key in seen:
                     continue
                 seen.add(key)
                 results.append(rec)
+
+        # Canonical ordering: evidence-manifest order, then in-file order.
+        results.sort(key=lambda r: self._record_position.get(id(r), (10 ** 9, 10 ** 9)))
         return results
 
     def records_for_resource(self, resource_id, audit_at=None):
