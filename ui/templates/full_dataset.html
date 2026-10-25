@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+
+{% block title %}Full Dataset Analysis - Ghost Data Still Exists{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-lg-12">
+        <h2><i class="bi bi-database"></i> Full Dataset Analysis</h2>
+        <p class="text-muted">Process all 518 deletion requests from the dataset</p>
+    </div>
+</div>
+
+<div class="row mt-3">
+    <div class="col-lg-8">
+        <div class="card">
+            <div class="card-header">
+                <h5>Run Analysis</h5>
+            </div>
+            <div class="card-body">
+                <p>This will process all requests in <code>dataset/deletion_requests.csv</code> and generate <code>output.csv</code> at the repository root.</p>
+                <button id="runFullBtn" class="btn btn-primary btn-lg">
+                    <i class="bi bi-play-circle"></i> Run Full Dataset Analysis
+                </button>
+                <div id="status" class="mt-3" style="display: none;"></div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-lg-4">
+        <div class="card">
+            <div class="card-header">
+                <h5>Download</h5>
+            </div>
+            <div class="card-body text-center">
+                <p>Download the generated output.csv</p>
+                <a href="{{ url_for('download_output') }}" class="btn btn-success">
+                    <i class="bi bi-download"></i> Download output.csv
+                </a>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.getElementById('runFullBtn').addEventListener('click', function() {
+    const btn = this;
+    const status = document.getElementById('status');
+    
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Processing...';
+    status.style.display = 'block';
+    status.innerHTML = '<div class="alert alert-info">Analyzing all 518 cases... This may take a moment.</div>';
+    
+    fetch('/run_full_dataset', {method: 'POST'})
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                status.innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle"></i> ' + data.message + '</div>';
+            } else {
+                status.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-circle"></i> Error: ' + data.error + '</div>';
+            }
+        })
+        .catch(error => {
+            status.innerHTML = '<div class="alert alert-danger"><i class="bi bi-exclamation-circle"></i> Error: ' + error + '</div>';
+        })
+        .finally(() => {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="bi bi-play-circle"></i> Run Full Dataset Analysis';
+        });
+});
+</script>
+{% endblock %}

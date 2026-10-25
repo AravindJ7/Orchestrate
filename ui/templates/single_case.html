@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+
+{% block title %}Single Case Analysis - Ghost Data Still Exists{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-lg-12">
+        <h2><i class="bi bi-file-earmark-text"></i> Single Case Analysis</h2>
+        <p class="text-muted">Analyze an individual deletion request</p>
+    </div>
+</div>
+
+<div class="row mt-3">
+    <div class="col-lg-10">
+        <div class="card">
+            <div class="card-header">
+                <h5>Case Details</h5>
+            </div>
+            <div class="card-body">
+                <form action="{{ url_for('analyze_single') }}" method="POST">
+                    <div class="row mb-3">
+                        <div class="col-md-6">
+                            <label for="case_id" class="form-label">Case ID</label>
+                            <input type="text" class="form-control" id="case_id" name="case_id" placeholder="e.g., case_001" required>
+                        </div>
+                        <div class="col-md-6">
+                            <label for="email" class="form-label">Email</label>
+                            <input type="email" class="form-control" id="email" name="email" placeholder="user@example.com" required>
+                        </div>
+                    </div>
+                    
+                    <div class="row mb-3">
+                        <div class="col-md-4">
+                            <label for="requested_at" class="form-label">Requested At</label>
+                            <input type="text" class="form-control" id="requested_at" name="requested_at" placeholder="2026-01-01T00:00:00Z">
+                        </div>
+                        <div class="col-md-4">
+                            <label for="reported_status" class="form-label">Reported Status</label>
+                            <select class="form-select" id="reported_status" name="reported_status">
+                                <option value="NOT_STARTED">NOT_STARTED</option>
+                                <option value="PARTIALLY_COMPLETE">PARTIALLY_COMPLETE</option>
+                                <option value="COMPLETE">COMPLETE</option>
+                            </select>
+                        </div>
+                        <div class="col-md-4">
+                            <label for="audit_at" class="form-label">Audit At (Required)</label>
+                            <input type="text" class="form-control" id="audit_at" name="audit_at" placeholder="2026-09-15T12:00:00Z" required>
+                        </div>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="reported_at" class="form-label">Reported At</label>
+                        <input type="text" class="form-control" id="reported_at" name="reported_at" placeholder="2026-01-01T00:00:00Z">
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="request_text" class="form-label">Request Text</label>
+                        <textarea class="form-control" id="request_text" name="request_text" rows="4" 
+                                  placeholder="Enter the deletion request text..." required></textarea>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-success">
+                        <i class="bi bi-search"></i> Analyze Case
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
